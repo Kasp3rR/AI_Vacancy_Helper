@@ -1,16 +1,17 @@
 # AI Vacancy Helper
 
 Backend ИИ-помощника по подбору вакансий на hh.ru.
-Реализованы этапы **1–3**: каркас FastAPI, PostgreSQL/Redis в Docker Compose,
-SQLAlchemy-модели и начальная миграция Alembic.
+Реализованы этапы **1–6**: каркас FastAPI, PostgreSQL/Redis, SQLAlchemy/Alembic,
+JWT-аутентификация, загрузка и извлечение текста PDF, анализ профиля через Ollama/Qwen3-4B.
 
-JWT, загрузка PDF, Ollama, Celery, hh.ru, кэширование и ранжирование будут
-добавляться следующими этапами. Таблицы для них подготовлены, бизнес-API пока нет.
+Обработка PDF и вызов модели пока синхронные. Celery, статусы фоновых задач,
+hh.ru, кэширование и ранжирование появятся в следующих этапах.
 
 ## Стек текущего этапа
 
 Python 3.12, FastAPI, Uvicorn, Pydantic 2, pydantic-settings, PostgreSQL 16,
-SQLAlchemy 2, Alembic, psycopg 3, Redis 7, uv, Ruff, mypy, pytest, pre-commit.
+SQLAlchemy 2, Alembic, psycopg 3, Redis 7, PyJWT, pwdlib/Argon2, PyMuPDF,
+HTTPX, Tenacity, Ollama, uv, Ruff, mypy, pytest, pre-commit.
 Версии Python-зависимостей зафиксированы в `uv.lock`.
 
 ## Быстрый запуск в Docker
@@ -19,7 +20,8 @@ SQLAlchemy 2, Alembic, psycopg 3, Redis 7, uv, Ruff, mypy, pytest, pre-commit.
 
 ```bash
 cp .env.example .env
-# При необходимости отредактируйте порты и локальные параметры в .env.
+# Сгенерируйте секрет: openssl rand -hex 32
+# Запишите результат в JWT_SECRET в .env. При необходимости измените порты.
 docker compose up -d --build --wait
 curl http://localhost:8000/health
 ```
@@ -40,7 +42,8 @@ docker compose logs api migrate
 docker compose down
 ```
 
-Данные сохраняются в именованных томах `postgres_data` и `redis_data`.
+Данные сохраняются в именованных томах `postgres_data`, `redis_data`, `uploads`
+и, при использовании профиля `llm`, `ollama_data`.
 `docker compose down -v` удаляет эти данные, поэтому не используйте его для обычной остановки.
 
 ## Локальная разработка
@@ -49,6 +52,7 @@ docker compose down
 
 ```bash
 cp .env.example .env
+# Заполните JWT_SECRET результатом openssl rand -hex 32
 uv sync --frozen
 uv run pre-commit install
 docker compose up -d --wait postgres redis
@@ -88,6 +92,10 @@ app/
   config.py     — настройки окружения
   db.py         — ленивое создание engine, фабрика сессий, dependency get_db
   models.py     — SQLAlchemy-модели
+  api/          — auth, resumes и зависимости авторизации
+  security.py   — Argon2 и JWT
+  schemas.py    — схемы запросов, ответов и профиля
+  services/     — извлечение текста PDF и клиент Ollama
 migrations/     — Alembic и начальная миграция
 tests/          — smoke-тест API и PostgreSQL-интеграционные тесты
 compose.yaml    — PostgreSQL, Redis, миграции и API
@@ -107,8 +115,8 @@ compose.yaml    — PostgreSQL, Redis, миграции и API
 статусы: `queued`, `running`, `succeeded`, `failed`.
 UUID, начальные значения и временные метки задаёт ORM. `updated_at` обновляется
 при SQLAlchemy UPDATE; серверных триггеров для прямых SQL-запросов нет.
-Профили и результаты пока хранятся в JSONB, их API-схемы появятся на следующих этапах.
-Email будет нормализоваться в слое аутентификации на этапе 4.
+Профили и результаты хранятся в JSONB; профиль проверяется схемой Pydantic.
+Email нормализуется до нижнего регистра перед регистрацией и входом.
 
 ## Миграции
 
@@ -134,14 +142,117 @@ uv run mypy
 uv run pytest
 ```
 
-Без `TEST_DATABASE_URL` выполняется smoke-тест API, 4 PostgreSQL-теста пропускаются.
-Для всех **5 текущих тестов**, когда PostgreSQL запущен (укажите фактический порт):
+Без `TEST_DATABASE_URL` выполняются 12 тестов API health, PDF и Ollama,
+13 PostgreSQL-тестов пропускаются. Для всех **25 текущих тестов**, когда PostgreSQL
+запущен (укажите фактический порт):
 
 ```bash
 TEST_DATABASE_URL=postgresql+psycopg://jobhelper:jobhelper@localhost:55433/jobhelper uv run pytest
 ```
 
-Интеграционные тесты создают отдельную случайную схему внутри транзакции и откатывают
-её после каждого теста. Требуется право `CREATE` на БД. Проверяются upgrade/downgrade,
-работа ORM с JSONB и временными метками, внешние ключи, уникальность, типы/статусы задач
-и диапазон score. Заявленные 25 тестов будут набраны к этапу 13 по мере реализации функций.
+Интеграционные тесты используют отдельные случайные схемы, которые удаляются либо
+откатываются после проверки; API-тесты используют реальные коммиты внутри своей схемы.
+Требуется право `CREATE` на БД. Проверяются миграции и ограничения,
+JWT, конкурентная ротация refresh-токенов, отзыв доступа, изоляция пользователей,
+загрузка PDF, очистка файлов при ошибке БД и обработка ошибок модели.
+В автотестах ответы Ollama подменяются через respx — модель скачивать не требуется.
+PyMuPDF может выдавать DeprecationWarning от SWIG на Python 3.12; это предупреждения
+зависимости, не ошибки тестов. При реализации дальнейших этапов набор тестов расширяется.
+
+
+## JWT-аутентификация
+
+`JWT_SECRET` обязателен, минимум 32 символа. Используйте случайное значение;
+не передавайте `.env` в Git. JWT подписываются HS256, проверяются issuer, audience,
+тип токена, срок действия и идентификаторы. Пароли (10–128 символов) хешируются Argon2id.
+
+| Метод и путь | Тело / результат |
+|---|---|
+| `POST /auth/register` | JSON `email`, `password`; 201 и пара токенов |
+| `POST /auth/login` | JSON `email`, `password`; 200 и пара токенов |
+| `POST /auth/refresh` | JSON `refresh_token`; новая пара токенов |
+| `POST /auth/logout` | JSON `refresh_token`; 204 |
+| `GET /auth/me` | Bearer access-токен; ID, email, дата регистрации |
+
+Access-токен действует 15 минут, refresh — 7 дней (`ACCESS_MINUTES`, `REFRESH_DAYS`).
+Refresh используется однократно: конкурентные запросы обновления дают один успех.
+При ротации старые access и refresh отзываются; клиент должен сохранить оба новых токена.
+Выход отзывает предъявленный refresh и связанный access, другие входы пользователя
+сохраняют доступ. Отзыв проверяется в БД при каждом защищённом запросе.
+Повторный выход с уже отозванным, но ещё не истёкшим refresh возвращает 204.
+Сами refresh-токены в БД не хранятся — только JTI и сведения об отзыве.
+Ответы с токенами запрещают кэширование; ошибки валидации не возвращают введённые пароли.
+
+## PDF и извлечение профиля
+
+| Метод и путь | Назначение |
+|---|---|
+| `POST /resumes` | Multipart поле `file`: проверка PDF, сохранение; 201 |
+| `GET /resumes/{id}` | Данные собственного резюме и профиль, если анализ выполнен |
+| `POST /resumes/{id}/analyze` | Синхронный анализ PDF через Qwen3-4B и сохранение профиля |
+
+Для всех запросов нужен заголовок `Authorization: Bearer <access_token>`.
+Чужие и отсутствующие резюме возвращают 404. Путь к файлу и исходный текст в API не выдаются.
+Имя файла хранения генерируется из UUID, пользовательское имя не влияет на путь.
+PDF сохраняются в `UPLOAD_DIR`, в Compose — в отдельном томе `/app/uploads`.
+
+По умолчанию: 10 МиБ (`MAX_PDF_BYTES`), 50 страниц (`MAX_PDF_PAGES`),
+40 000 символов извлечённого текста (`MAX_TEXT_CHARS`). Превышение — 413,
+неподдерживаемый MIME — 415, повреждённый PDF, шифрование или отсутствие текста — 422.
+Сканы без текстового слоя требуют OCR, который в этот этап не входит.
+Проверяется содержимое PDF, а не только расширение. Лимит файла проверяется после
+multipart-разбора; при внешнем развёртывании задайте также лимит тела запроса в reverse proxy.
+
+Пример после регистрации и получения access-токена:
+
+```bash
+curl -X POST http://localhost:8000/resumes \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -F "file=@resume.pdf;type=application/pdf"
+curl -X POST "http://localhost:8000/resumes/$RESUME_ID/analyze" \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+Профиль: `title`, `skills`, `keywords`, `experience_years`, `salary`, `currency`, `region`.
+Неизвестные скалярные значения — `null`, списки — `[]`. Навыки и ключевые слова
+нормализуются по регистру, дубликаты удаляются. Модель получает JSON Schema,
+а её ответ повторно проверяется Pydantic; лишние поля и неверные типы отклоняются.
+Схема валидирует структуру, но не гарантирует фактическую точность извлечения моделью.
+При неуспешном повторном анализе существующий профиль сохраняется.
+
+## Ollama и Qwen3-4B
+
+Ollama не запускается при обычном `docker compose up` — он выделен в профиль `llm`:
+
+```bash
+docker compose --profile llm up -d --wait ollama
+docker compose exec ollama ollama pull qwen3:4b-instruct
+```
+
+Скачивание модели требует около 2.5 ГБ диска. Первый анализ может быть медленнее
+из-за загрузки модели. В контейнере без GPU используется CPU.
+
+Для нативного Ollama (например, на macOS):
+
+```bash
+ollama serve
+# В другом терминале:
+ollama pull qwen3:4b-instruct
+```
+
+Локальный Python использует `OLLAMA_URL=http://localhost:11434`.
+API в Compose по умолчанию обращается к `http://ollama:11434`.
+Для нативного Ollama на macOS задайте в `.env`
+`OLLAMA_DOCKER_URL=http://host.docker.internal:11434` и пересоздайте API:
+`docker compose up -d api`.
+
+Модель задаётся через `OLLAMA_MODEL=qwen3:4b-instruct`.
+Таймаут ответа — `OLLAMA_TIMEOUT_SECONDS=180` секунд. Таймаут возвращается как 504,
+недоступный сервис/модель — 503, невалидный или незавершённый ответ — 502.
+Ошибки соединения и HTTP 429/502/503/504 повторяются до трёх попыток с задержкой;
+таймауты и невалидные ответы не повторяются. Системные HTTP-прокси
+для передачи текста резюме не используются. При отсутствии Ollama загрузка PDF
+и аутентификация продолжают работать, ошибка появляется только при анализе.
+
+Интеграция следует [документации structured outputs](https://docs.ollama.com/capabilities/structured-outputs)
+и использует [qwen3:4b-instruct](https://ollama.com/library/qwen3:4b-instruct).

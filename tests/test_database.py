@@ -1,43 +1,16 @@
 """Run against PostgreSQL; each test uses a private, rolled-back schema."""
 
-import os
 from uuid import uuid4
 
 import pytest
 from alembic import command
-from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import Job, Recommendation, Resume, User
 
 pytestmark = pytest.mark.integration
-
-
-@pytest.fixture
-def migrated_database():
-    url = os.getenv("TEST_DATABASE_URL")
-    if not url:
-        pytest.skip("Set TEST_DATABASE_URL to run PostgreSQL migration checks")
-    engine = create_engine(url)
-    if engine.dialect.name != "postgresql":
-        pytest.fail("Integration tests require PostgreSQL")
-    schema = "test_" + uuid4().hex
-    try:
-        with engine.connect() as connection:
-            transaction = connection.begin()
-            try:
-                connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-                connection.execute(text(f'SET LOCAL search_path TO "{schema}"'))
-                config = Config("alembic.ini")
-                config.attributes["connection"] = connection
-                command.upgrade(config, "head")
-                yield connection, config, schema
-            finally:
-                transaction.rollback()
-    finally:
-        engine.dispose()
 
 
 def test_migration_round_trip(migrated_database):

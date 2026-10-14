@@ -36,6 +36,16 @@ services:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-jobhelper}:${POSTGRES_PASSWORD:-jobhelper}@postgres:5432/${POSTGRES_DB:-jobhelper}
       REDIS_URL: redis://redis:6379/0
       APP_NAME: ${APP_NAME:-AI Vacancy Helper}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      ACCESS_MINUTES: ${ACCESS_MINUTES:-15}
+      REFRESH_DAYS: ${REFRESH_DAYS:-7}
+      UPLOAD_DIR: /app/uploads
+      MAX_PDF_BYTES: ${MAX_PDF_BYTES:-10485760}
+      MAX_PDF_PAGES: ${MAX_PDF_PAGES:-50}
+      MAX_TEXT_CHARS: ${MAX_TEXT_CHARS:-40000}
+      OLLAMA_URL: ${OLLAMA_DOCKER_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:4b-instruct}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-180}
     command: ["uv", "run", "--no-sync", "alembic", "upgrade", "head"]
     depends_on:
       postgres:
@@ -44,6 +54,8 @@ services:
   api:
     build: .
     environment: *app_environment
+    volumes:
+      - uploads:/app/uploads
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
     depends_on:
@@ -57,6 +69,21 @@ services:
       timeout: 3s
       retries: 5
 
+  ollama:
+    image: ollama/ollama:0.13.5
+    profiles: [llm]
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
 volumes:
   postgres_data:
   redis_data:
+  uploads:
+  ollama_data:
