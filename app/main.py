@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.api import auth, jobs, resumes
+from app.api import auth, jobs, resumes, search
 from app.config import get_settings
 
 
@@ -12,6 +12,7 @@ def create_app() -> FastAPI:
     application.include_router(auth.router)
     application.include_router(resumes.router)
     application.include_router(jobs.router)
+    application.include_router(search.router)
 
     @application.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:

@@ -98,7 +98,7 @@ def test_broker_failure_keeps_job_and_recovery_republishes(api, settings, pdf_by
         db.commit()
     publish = mocker.patch("app.services.jobs.publish_job", return_value=True)
     assert recover_jobs(api.sessions, settings) == 1
-    publish.assert_called_once_with(job_id)
+    publish.assert_called_once_with(job_id, "resume")
     assert recover_jobs(api.sessions, settings) == 0
 
 

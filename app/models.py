@@ -8,6 +8,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -87,9 +88,11 @@ class Recommendation(Base):
     __table_args__ = (
         UniqueConstraint("job_id", "vacancy_id", name="uq_recommendations_job_vacancy"),
         CheckConstraint("score >= 0 AND score <= 100", name="ck_recommendations_score"),
+        CheckConstraint("position >= 0", name="ck_recommendations_position"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), index=True)
     vacancy_id: Mapped[str] = mapped_column(String(32))
-    score: Mapped[float]
+    position: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    score: Mapped[float | None]
     data: Mapped[dict[str, Any]] = mapped_column(json_type)

@@ -30,7 +30,9 @@ def page(items, number=0, pages=1):
 def test_search_headers_filters_and_nullable_fields(settings):
     with respx.mock as mock:
         route = mock.get(settings.hh_url + "/vacancies").respond(200, json=page([vacancy()]))
-        result = HHClient(settings).search(HHSearch(text="Python", area="1", salary=100000))
+        result = HHClient(settings, use_cache=False).search(
+            HHSearch(text="Python", area="1", salary=100000)
+        )
     request = route.calls[0].request
     assert request.headers["HH-User-Agent"] == settings.hh_user_agent
     assert request.url.params["area"] == "1"
@@ -46,7 +48,9 @@ def test_pagination_deduplicates_and_stops(settings):
             httpx.Response(200, json=page([vacancy("1")], 0, 2)),
             httpx.Response(200, json=page([vacancy("1"), vacancy("2")], 1, 2)),
         ]
-        result = HHClient(settings).search_all(HHSearch(text="Python"), max_pages=3)
+        result = HHClient(settings, use_cache=False).search_all(
+            HHSearch(text="Python"), max_pages=3
+        )
         assert [item.id for item in result] == ["1", "2"]
         assert route.call_count == 2
         assert route.calls[1].request.url.params["page"] == "1"
@@ -56,13 +60,13 @@ def test_details_and_no_retry_on_missing_or_forbidden(settings):
     with respx.mock as mock:
         detail = dict(vacancy(), key_skills=[{"name": "Python"}], description="Backend")
         route = mock.get(settings.hh_url + "/vacancies/1").respond(200, json=detail)
-        assert HHClient(settings).vacancy("1").key_skills[0].name == "Python"
+        assert HHClient(settings, use_cache=False).vacancy("1").key_skills[0].name == "Python"
         route.respond(404)
         with pytest.raises(HHNotFound):
-            HHClient(settings).vacancy("1")
+            HHClient(settings, use_cache=False).vacancy("1")
         route.respond(403)
         with pytest.raises(HHRequestRejected):
-            HHClient(settings).vacancy("1")
+            HHClient(settings, use_cache=False).vacancy("1")
         assert route.call_count == 3
 
 
@@ -74,13 +78,13 @@ def test_retries_rate_limit_and_server_error(settings):
             httpx.Response(503, headers={"Retry-After": "Thu, 01 Jan 1970 00:00:00 GMT"}),
             httpx.Response(200, json=page([])),
         ]
-        assert HHClient(settings).search(HHSearch(text="Python")).items == []
+        assert HHClient(settings, use_cache=False).search(HHSearch(text="Python")).items == []
         assert route.call_count == 3
     with respx.mock as mock:
         route = mock.get(settings.hh_url + "/vacancies")
         route.side_effect = httpx.ReadTimeout("upstream timeout")
         with pytest.raises(HHUnavailable):
-            HHClient(settings).search(HHSearch(text="Python"))
+            HHClient(settings, use_cache=False).search(HHSearch(text="Python"))
         assert route.call_count == 3
 
 
@@ -88,7 +92,7 @@ def test_invalid_response_is_not_retried(settings):
     with respx.mock as mock:
         route = mock.get(settings.hh_url + "/vacancies").respond(200, json={"bad": "data"})
         with pytest.raises(HHInvalidResponse):
-            HHClient(settings).search(HHSearch(text="Python"))
+            HHClient(settings, use_cache=False).search(HHSearch(text="Python"))
         assert route.call_count == 1
 
 
@@ -97,8 +101,12 @@ def test_search_limits_and_path_validation(settings):
         HHSearch(text="Python", per_page=101)
     with respx.mock:
         with pytest.raises(ValueError, match="2000"):
-            HHClient(settings).search(HHSearch(text="Python", page=20, per_page=100))
+            HHClient(settings, use_cache=False).search(
+                HHSearch(text="Python", page=20, per_page=100)
+            )
         with pytest.raises(ValueError, match="2000"):
-            HHClient(settings).search_all(HHSearch(text="Python", page=20, per_page=100))
+            HHClient(settings, use_cache=False).search_all(
+                HHSearch(text="Python", page=20, per_page=100)
+            )
         with pytest.raises(ValueError):
-            HHClient(settings).vacancy("../me")
+            HHClient(settings, use_cache=False).vacancy("../me")

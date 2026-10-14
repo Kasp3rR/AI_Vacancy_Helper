@@ -1,11 +1,13 @@
+from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, HTTPException, Query
+from sqlalchemy import func, select
 
 from app.api.dependencies import CurrentUser, Db
-from app.models import Job, Resume
-from app.schemas import JobResponse
+from app.models import Job, Recommendation, Resume
+from app.schemas import JobResponse, SearchResult, SearchResultsResponse
+from app.services.hh import Vacancy
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -18,3 +20,43 @@ def get_job(job_id: UUID, user: CurrentUser, db: Db) -> Job:
     if job is None:
         raise HTTPException(404, "Job not found")
     return job
+
+
+@router.get("/{job_id}/results", response_model=SearchResultsResponse)
+def get_results(
+    job_id: UUID,
+    user: CurrentUser,
+    db: Db,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> SearchResultsResponse:
+    job = get_job(job_id, user, db)
+    if job.kind != "search":
+        raise HTTPException(409, "Only search jobs have vacancy results")
+    if job.status != "succeeded":
+        raise HTTPException(409, "Search results are not ready; check the job status")
+    total = (
+        db.scalar(
+            select(func.count()).select_from(Recommendation).where(Recommendation.job_id == job.id)
+        )
+        or 0
+    )
+    rows = db.scalars(
+        select(Recommendation)
+        .where(Recommendation.job_id == job.id)
+        .order_by(Recommendation.position, Recommendation.id)
+        .offset(offset)
+        .limit(limit)
+    )
+    return SearchResultsResponse(
+        job=JobResponse.model_validate(job),
+        total=total,
+        offset=offset,
+        limit=limit,
+        items=[
+            SearchResult(
+                vacancy=Vacancy.model_validate(row.data), position=row.position, score=row.score
+            )
+            for row in rows
+        ],
+    )

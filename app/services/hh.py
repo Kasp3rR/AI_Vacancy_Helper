@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, HttpUrl, ValidationError
 from tenacity import RetryCallState, retry, retry_if_exception, stop_after_attempt
 
 from app.config import Settings
+from app.services.hh_cache import HHCache
 
 
 class HHError(Exception):
@@ -110,8 +111,9 @@ def get_response(client: httpx.Client, path: str, params: dict[str, Any]) -> htt
 
 
 class HHClient:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, cache: HHCache | None = None, *, use_cache: bool = True):
         self.settings = settings
+        self.cache = (cache if cache is not None else HHCache(settings)) if use_cache else None
 
     def _get(self, path: str, params: dict[str, Any]) -> Any:
         try:
@@ -143,15 +145,25 @@ class HHClient:
     def search(self, query: HHSearch) -> SearchPage:
         if (query.page + 1) * query.per_page > 2000:
             raise ValueError("hh.ru search depth cannot exceed 2000 results")
+        params = query.model_dump(exclude_none=True)
+        if self.cache is not None:
+            cached = self.cache.get("/vacancies", params)
+            if cached is not None:
+                try:
+                    result = SearchPage.model_validate(cached)
+                    if result.page == query.page and result.per_page == query.per_page:
+                        return result
+                except ValidationError:
+                    pass
         try:
-            result = SearchPage.model_validate(
-                self._get("/vacancies", query.model_dump(exclude_none=True))
-            )
-            if result.page != query.page:
+            result = SearchPage.model_validate(self._get("/vacancies", params))
+            if result.page != query.page or result.per_page != query.per_page:
                 raise HHInvalidResponse("hh.ru returned an unexpected page")
-            return result
         except ValidationError:
             raise HHInvalidResponse("hh.ru returned an invalid search response") from None
+        if self.cache is not None:
+            self.cache.set("/vacancies", params, result.model_dump(mode="json", by_alias=True))
+        return result
 
     def search_all(self, query: HHSearch, max_pages: int = 3) -> list[Vacancy]:
         if not 1 <= max_pages <= 20:
@@ -170,7 +182,22 @@ class HHClient:
     def vacancy(self, vacancy_id: str) -> Vacancy:
         if not re.fullmatch(r"[0-9]+", vacancy_id):
             raise ValueError("Vacancy ID must contain only digits")
+        path = f"/vacancies/{vacancy_id}"
+        if self.cache is not None:
+            cached = self.cache.get(path, {})
+            if cached is not None:
+                try:
+                    result = Vacancy.model_validate(cached)
+                    if result.id == vacancy_id:
+                        return result
+                except ValidationError:
+                    pass
         try:
-            return Vacancy.model_validate(self._get(f"/vacancies/{vacancy_id}", {}))
+            result = Vacancy.model_validate(self._get(path, {}))
+            if result.id != vacancy_id:
+                raise HHInvalidResponse("hh.ru returned an unexpected vacancy")
         except ValidationError:
             raise HHInvalidResponse("hh.ru returned an invalid vacancy") from None
+        if self.cache is not None:
+            self.cache.set(path, {}, result.model_dump(mode="json", by_alias=True))
+        return result

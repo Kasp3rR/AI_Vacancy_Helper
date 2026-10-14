@@ -2,7 +2,17 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    SecretStr,
+    StringConstraints,
+    field_validator,
+)
+
+from app.services.hh import HHSearch, Vacancy
 
 
 class Credentials(BaseModel):
@@ -75,3 +85,38 @@ class JobResponse(BaseModel):
 class UploadResponse(BaseModel):
     resume: ResumeResponse
     job: JobResponse
+
+
+SearchText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+
+
+class SearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: SearchText | None = None
+    area: str | None = Field(default=None, pattern=r"^\d+$")
+    salary: int | None = Field(default=None, ge=0)
+    currency: Literal["RUR", "USD", "EUR"] = "RUR"
+    experience: Literal["noExperience", "between1And3", "between3And6", "moreThan6"] | None = None
+    per_page: int = Field(default=20, ge=1, le=50)
+    max_pages: int = Field(default=1, ge=1, le=3)
+
+
+class SearchSpec(BaseModel):
+    query: HHSearch
+    max_pages: int = Field(ge=1, le=3)
+    profile: Profile
+
+
+class SearchResult(BaseModel):
+    vacancy: Vacancy
+    position: int
+    score: float | None
+
+
+class SearchResultsResponse(BaseModel):
+    job: JobResponse
+    ranked: Literal[False] = False
+    total: int
+    offset: int
+    limit: int
+    items: list[SearchResult]
