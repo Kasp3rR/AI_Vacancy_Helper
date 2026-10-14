@@ -59,3 +59,19 @@ class ResumeResponse(BaseModel):
     filename: str
     profile: Profile | None
     created_at: datetime
+
+
+class JobResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: UUID
+    resume_id: UUID
+    kind: Literal["resume", "search"]
+    status: Literal["queued", "running", "succeeded", "failed"]
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class UploadResponse(BaseModel):
+    resume: ResumeResponse
+    job: JobResponse

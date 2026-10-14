@@ -76,6 +76,7 @@ def test_database_rejects_invalid_status_score_and_duplicates(migrated_database)
         session.add(Recommendation(job_id=job.id, vacancy_id="123", score=80, data={}))
         session.flush()
         invalid_rows = [
+            Job(resume_id=resume.id, kind="search", status="queued"),
             User(email=user.email, password_hash="duplicate"),
             Job(resume_id=resume.id, kind="invalid"),
             Job(resume_id=resume.id, kind="search", status="invalid"),

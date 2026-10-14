@@ -88,7 +88,8 @@ class APIClient:
 
 
 @pytest.fixture
-def api(settings):
+def api(settings, mocker):
+    mocker.patch("app.api.resumes.publish_job", return_value=True)
     url = os.getenv("TEST_DATABASE_URL")
     if not url:
         pytest.skip("Set TEST_DATABASE_URL for PostgreSQL API tests")

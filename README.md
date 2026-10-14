@@ -1,17 +1,17 @@
 # AI Vacancy Helper
 
 Backend ИИ-помощника по подбору вакансий на hh.ru.
-Реализованы этапы **1–6**: каркас FastAPI, PostgreSQL/Redis, SQLAlchemy/Alembic,
-JWT-аутентификация, загрузка и извлечение текста PDF, анализ профиля через Ollama/Qwen3-4B.
+Реализованы этапы **1–9**: каркас FastAPI, PostgreSQL/Redis, SQLAlchemy/Alembic,
+JWT-аутентификация, фоновая обработка PDF через Celery и Ollama/Qwen3-4B,
+API статусов задач и клиент hh.ru.
 
-Обработка PDF и вызов модели пока синхронные. Celery, статусы фоновых задач,
-hh.ru, кэширование и ранжирование появятся в следующих этапах.
+Кэширование hh.ru, фоновый подбор вакансий и ранжирование появятся в этапах 10–12.
 
 ## Стек текущего этапа
 
 Python 3.12, FastAPI, Uvicorn, Pydantic 2, pydantic-settings, PostgreSQL 16,
 SQLAlchemy 2, Alembic, psycopg 3, Redis 7, PyJWT, pwdlib/Argon2, PyMuPDF,
-HTTPX, Tenacity, Ollama, uv, Ruff, mypy, pytest, pre-commit.
+HTTPX, Tenacity, Ollama, Celery 5, uv, Ruff, mypy, pytest, pre-commit.
 Версии Python-зависимостей зафиксированы в `uv.lock`.
 
 ## Быстрый запуск в Docker
@@ -29,7 +29,7 @@ curl http://localhost:8000/health
 Ответ: `{"status":"ok"}`. Swagger UI: <http://localhost:8000/docs>.
 
 Compose запускает PostgreSQL и Redis, ждёт готовности PostgreSQL,
-применяет миграции отдельным одноразовым сервисом `migrate`, затем запускает API.
+применяет миграции отдельным одноразовым сервисом `migrate`, затем запускает API, worker и beat.
 `migrate` со статусом `Exited (0)` — нормальный результат успешной миграции.
 API работает от непривилегированного пользователя контейнера.
 
@@ -38,7 +38,7 @@ API работает от непривилегированного пользо�
 
 ```bash
 docker compose ps -a
-docker compose logs api migrate
+docker compose logs api worker beat migrate
 docker compose down
 ```
 
@@ -95,7 +95,9 @@ app/
   api/          — auth, resumes и зависимости авторизации
   security.py   — Argon2 и JWT
   schemas.py    — схемы запросов, ответов и профиля
-  services/     — извлечение текста PDF и клиент Ollama
+  celery_app.py — broker, result backend и расписание восстановления
+  tasks.py      — задачи Celery
+  services/     — PDF, Ollama, hh.ru, обработка и восстановление задач
 migrations/     — Alembic и начальная миграция
 tests/          — smoke-тест API и PostgreSQL-интеграционные тесты
 compose.yaml    — PostgreSQL, Redis, миграции и API
@@ -142,8 +144,8 @@ uv run mypy
 uv run pytest
 ```
 
-Без `TEST_DATABASE_URL` выполняются 12 тестов API health, PDF и Ollama,
-13 PostgreSQL-тестов пропускаются. Для всех **25 текущих тестов**, когда PostgreSQL
+Без `TEST_DATABASE_URL` выполняются 18 тестов API health, PDF, Ollama и hh.ru,
+19 PostgreSQL-тестов пропускаются. Для всех **37 текущих тестов**, когда PostgreSQL
 запущен (укажите фактический порт):
 
 ```bash
@@ -155,7 +157,11 @@ TEST_DATABASE_URL=postgresql+psycopg://jobhelper:jobhelper@localhost:55433/jobhe
 Требуется право `CREATE` на БД. Проверяются миграции и ограничения,
 JWT, конкурентная ротация refresh-токенов, отзыв доступа, изоляция пользователей,
 загрузка PDF, очистка файлов при ошибке БД и обработка ошибок модели.
-В автотестах ответы Ollama подменяются через respx — модель скачивать не требуется.
+Проверяются также конкурентный запуск и повторная доставка задач, восстановление
+публикации после ошибки брокера, защита от записи результата устаревшим worker
+и пагинация/retry hh.ru. В автотестах ответы Ollama и hh.ru подменяются через respx,
+публикация задач — через mock; Redis и модель для pytest не требуются.
+Работа настоящего Celery/Redis проверяется отдельно в Docker.
 PyMuPDF может выдавать DeprecationWarning от SWIG на Python 3.12; это предупреждения
 зависимости, не ошибки тестов. При реализации дальнейших этапов набор тестов расширяется.
 
@@ -187,9 +193,10 @@ Refresh используется однократно: конкурентные 
 
 | Метод и путь | Назначение |
 |---|---|
-| `POST /resumes` | Multipart поле `file`: проверка PDF, сохранение; 201 |
+| `POST /resumes` | Multipart `file`: сохранение PDF и постановка анализа; 202, объект `{resume, job}` |
 | `GET /resumes/{id}` | Данные собственного резюме и профиль, если анализ выполнен |
-| `POST /resumes/{id}/analyze` | Синхронный анализ PDF через Qwen3-4B и сохранение профиля |
+| `POST /resumes/{id}/analyze` | Повторный запуск анализа; 202, объект задачи |
+| `GET /jobs/{id}` | Статус собственной задачи и безопасное описание ошибки |
 
 Для всех запросов нужен заголовок `Authorization: Bearer <access_token>`.
 Чужие и отсутствующие резюме возвращают 404. Путь к файлу и исходный текст в API не выдаются.
@@ -197,8 +204,11 @@ Refresh используется однократно: конкурентные 
 PDF сохраняются в `UPLOAD_DIR`, в Compose — в отдельном томе `/app/uploads`.
 
 По умолчанию: 10 МиБ (`MAX_PDF_BYTES`), 50 страниц (`MAX_PDF_PAGES`),
-40 000 символов извлечённого текста (`MAX_TEXT_CHARS`). Превышение — 413,
-неподдерживаемый MIME — 415, повреждённый PDF, шифрование или отсутствие текста — 422.
+40 000 символов извлечённого текста (`MAX_TEXT_CHARS`). API проверяет размер файла
+(превышение — 413), MIME (415) и сигнатуру PDF (422). Проверка структуры, числа
+страниц, извлечение текста и вызов модели выполняются только в worker.
+Повреждённый/зашифрованный PDF, превышение лимитов страниц/текста или пустой текст
+переводят задачу в `failed`; причина доступна через `GET /jobs/{id}`.
 Сканы без текстового слоя требуют OCR, который в этот этап не входит.
 Проверяется содержимое PDF, а не только расширение. Лимит файла проверяется после
 multipart-разбора; при внешнем развёртывании задайте также лимит тела запроса в reverse proxy.
@@ -209,7 +219,10 @@ multipart-разбора; при внешнем развёртывании за�
 curl -X POST http://localhost:8000/resumes \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -F "file=@resume.pdf;type=application/pdf"
-curl -X POST "http://localhost:8000/resumes/$RESUME_ID/analyze" \
+curl "http://localhost:8000/jobs/$JOB_ID" \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+# Когда status = succeeded:
+curl "http://localhost:8000/resumes/$RESUME_ID" \
   -H "Authorization: Bearer $ACCESS_TOKEN"
 ```
 
@@ -241,14 +254,14 @@ ollama pull qwen3:4b-instruct
 ```
 
 Локальный Python использует `OLLAMA_URL=http://localhost:11434`.
-API в Compose по умолчанию обращается к `http://ollama:11434`.
+Worker в Compose по умолчанию обращается к `http://ollama:11434`.
 Для нативного Ollama на macOS задайте в `.env`
-`OLLAMA_DOCKER_URL=http://host.docker.internal:11434` и пересоздайте API:
-`docker compose up -d api`.
+`OLLAMA_DOCKER_URL=http://host.docker.internal:11434` и пересоздайте сервисы:
+`docker compose up -d api worker beat`.
 
 Модель задаётся через `OLLAMA_MODEL=qwen3:4b-instruct`.
-Таймаут ответа — `OLLAMA_TIMEOUT_SECONDS=180` секунд. Таймаут возвращается как 504,
-недоступный сервис/модель — 503, невалидный или незавершённый ответ — 502.
+Таймаут ответа — `OLLAMA_TIMEOUT_SECONDS=180` секунд. Таймаут, недоступность модели
+или невалидный/незавершённый ответ переводят задачу в `failed` с описанием в `error`.
 Ошибки соединения и HTTP 429/502/503/504 повторяются до трёх попыток с задержкой;
 таймауты и невалидные ответы не повторяются. Системные HTTP-прокси
 для передачи текста резюме не используются. При отсутствии Ollama загрузка PDF
@@ -256,3 +269,84 @@ API в Compose по умолчанию обращается к `http://ollama:11
 
 Интеграция следует [документации structured outputs](https://docs.ollama.com/capabilities/structured-outputs)
 и использует [qwen3:4b-instruct](https://ollama.com/library/qwen3:4b-instruct).
+
+
+## Celery, статусы и восстановление
+
+Redis разделён по базам: `/0` зарезервирована для кэша, `/1` — broker,
+`/2` — result backend. Настройки: `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`.
+API и worker должны использовать одну БД и один каталог PDF; в Compose общий том `uploads`.
+Если запускаете API и worker локально, используйте один абсолютный `UPLOAD_DIR`.
+
+Для локального запуска дополнительно нужны два терминала:
+
+```bash
+uv run celery -A app.celery_app:celery_app worker --loglevel=INFO --concurrency=1
+uv run celery -A app.celery_app:celery_app beat --loglevel=INFO --schedule=/tmp/jobhelper-celerybeat
+```
+
+На macOS для проверки worker можно использовать `--pool=solo`; полноценные hard/soft
+лимиты проверяются с prefork worker в Linux-контейнере. Запускайте один экземпляр beat.
+
+Загрузка атомарно создаёт в PostgreSQL резюме и задачу `queued`, затем публикует
+сообщение с её UUID в Celery. Идентификатор Celery совпадает с ID записи в `jobs`.
+Сообщение содержит только ID, без текста резюме. Переходы: `queued → running → succeeded/failed`.
+Результат профиля и `succeeded` сохраняются одной транзакцией.
+Источник статусов API — PostgreSQL; result backend Celery не используется для авторизации
+или выдачи профиля и очищает результаты через сутки.
+
+Для одного резюме допускается одна активная задача анализа: повторный или параллельный
+`POST /resumes/{id}/analyze` возвращает её ID. После завершения или ошибки этот endpoint
+создаёт новую задачу. Повторная доставка сообщения не запускает повторный анализ:
+worker атомарно захватывает только `queued`. Старый профиль сохраняется до успешного нового анализа.
+
+Если Redis временно недоступен или API завершился между коммитом БД и отправкой сообщения,
+задача остаётся в `queued`; API после сохранения возвращает 202. Beat каждые 30 секунд
+публикует служебную задачу восстановления. Она повторно отправляет до 100 старых `queued`
+задач за проход. Успешная публикация обновляет время попытки. Для восстановления должны
+работать Redis, beat и хотя бы один worker. Восстановление может задерживаться, пока
+единственный worker занят анализом. Без worker задача остаётся `queued`, а не считается успешной.
+
+Soft limit обработки — `3 × OLLAMA_TIMEOUT_SECONDS + 60`, hard limit — ещё 30 секунд.
+Задачи `running`, не завершённые к hard limit плюс 60 секунд, восстановление переводит
+в `failed`. При стандартных настройках это 690 секунд с начала выполнения.
+Завершившийся с опозданием worker не может перезаписать профиль такой задачи.
+Для повторного анализа вызовите `/resumes/{id}/analyze`.
+Неустранимые ошибки PDF и ошибки модели сохраняются в статусе; автоматический перезапуск
+всего анализа не выполняется, повторные HTTP-попытки ограничены клиентом Ollama.
+
+Миграция `80c15d7e8933` добавляет частичный уникальный индекс для активных задач.
+Она не меняет имеющиеся профили. При ручном заполнении БД до миграции убедитесь,
+что нет нескольких `queued/running` задач одного типа для одного резюме.
+
+## Клиент hh.ru
+
+`app/services/hh.py` содержит синхронный HTTPX-клиент для следующего этапа подбора:
+
+```python
+from app.config import get_settings
+from app.services.hh import HHClient, HHSearch
+
+client = HHClient(get_settings())
+query = HHSearch(text="Python developer", area="1", per_page=20)
+page = client.search(query)
+vacancies = client.search_all(query, max_pages=3)
+if vacancies:
+    details = client.vacancy(vacancies[0].id)
+```
+
+Поддерживаются текст, регион, зарплата, валюта и опыт. Максимум 100 элементов на страницу,
+глубина поиска ограничена 2000 результатами; `search_all` останавливается на последней
+или пустой странице и удаляет дубликаты ID. Полная карточка загружается отдельно:
+поисковая выдача может не содержать `key_skills` и описания. Отсутствующая зарплата и
+другие необязательные поля сохраняются как `None`.
+
+Задайте `HH_USER_AGENT` с названием приложения и контактной почтой разработчика
+(пример в `.env.example`); клиент отправляет `HH-User-Agent` и `User-Agent`.
+`HH_TIMEOUT_SECONDS=10` задаёт таймаут. Для транспортных ошибок, HTTP 429 и 5xx выполняется
+до трёх попыток. `Retry-After` поддерживается в секундах и в формате HTTP-date,
+задержка ограничена 10 секундами. HTTP 400/403/404 не повторяются; ошибки и невалидный JSON
+преобразуются в `HHRequestRejected`, `HHNotFound`, `HHUnavailable`, `HHInvalidResponse`.
+
+Кэш, API запуска подбора и сохранение рекомендаций пока не реализованы — это этапы 10–12.
+Контракт клиента сверялся с [официальной документацией hh.ru](https://api.hh.ru/openapi/redoc).

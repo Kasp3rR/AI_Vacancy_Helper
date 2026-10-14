@@ -2,7 +2,17 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, CheckConstraint, DateTime, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -49,6 +59,13 @@ class Resume(Base):
 class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
+        Index(
+            "uq_jobs_active_resume_kind",
+            "resume_id",
+            "kind",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
         CheckConstraint("kind IN ('resume', 'search')", name="ck_jobs_kind"),
         CheckConstraint(
             "status IN ('queued', 'running', 'succeeded', 'failed')", name="ck_jobs_status"

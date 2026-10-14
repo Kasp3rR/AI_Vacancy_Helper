@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     app_name: str = "AI Vacancy Helper"
     database_url: str = "postgresql+psycopg://jobhelper:jobhelper@localhost:5432/jobhelper"
     redis_url: str = "redis://localhost:6379/0"
+    celery_broker_url: str = "redis://localhost:6379/1"
+    celery_result_backend: str = "redis://localhost:6379/2"
+    hh_url: str = "https://api.hh.ru"
+    hh_user_agent: str = "AI-Vacancy-Helper/0.1 (https://github.com/Kasp3rR/AI_Vacancy_Helper)"
+    hh_timeout_seconds: float = Field(default=10, ge=1, le=60)
     jwt_secret: SecretStr = Field(min_length=32)
     access_minutes: int = Field(default=15, ge=1, le=60)
     refresh_days: int = Field(default=7, ge=1, le=90)
@@ -21,6 +26,10 @@ class Settings(BaseSettings):
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:4b-instruct"
     ollama_timeout_seconds: float = Field(default=180, ge=1, le=600)
+
+    @property
+    def job_time_limit(self) -> int:
+        return int(self.ollama_timeout_seconds * 3 + 90)
 
 
 @lru_cache

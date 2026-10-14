@@ -8,7 +8,7 @@ dependencies = [
   "pydantic-settings>=2.5,<3", "sqlalchemy>=2.0,<3", "alembic>=1.13,<2",
   "psycopg[binary]>=3.2,<4", "redis>=5,<7", "httpx>=0.27,<1",
   "pyjwt>=2.9,<3", "pwdlib[argon2]>=0.2,<1", "pymupdf>=1.24,<2",
-  "python-multipart>=0.0.18", "email-validator>=2.2,<3", "tenacity>=9,<10"
+  "python-multipart>=0.0.18", "email-validator>=2.2,<3", "tenacity>=9,<10", "celery[redis]>=5.4,<6"
 ]
 [dependency-groups]
 dev = [
@@ -31,5 +31,5 @@ strict = true
 files = ["app"]
 
 [[tool.mypy.overrides]]
-module = ["pymupdf.*"]
+module = ["pymupdf.*", "celery.*", "kombu.*", "billiard.*"]
 ignore_missing_imports = true

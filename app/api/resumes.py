@@ -1,5 +1,4 @@
 import os
-from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
@@ -8,9 +7,9 @@ from sqlalchemy import select
 
 from app.api.dependencies import Config, CurrentUser, Db
 from app.models import Resume, new_id
-from app.schemas import ResumeResponse
-from app.services.ollama import InvalidProfile, OllamaTimeout, OllamaUnavailable, extract_profile
-from app.services.pdf import InvalidPDF, PDFTooLarge, extract_text, load_text, read_bounded
+from app.schemas import JobResponse, ResumeResponse, UploadResponse
+from app.services.jobs import enqueue_resume, publish_job
+from app.services.pdf import InvalidPDF, PDFTooLarge, read_bounded
 
 router = APIRouter(prefix="/resumes", tags=["resumes"])
 
@@ -22,18 +21,19 @@ def owned_resume(resume_id: UUID, user_id: str, db: Db) -> Resume:
     return resume
 
 
-@router.post("", response_model=ResumeResponse, status_code=201)
+@router.post("", response_model=UploadResponse, status_code=202)
 def upload_resume(
     user: CurrentUser,
     db: Db,
     settings: Config,
     file: Annotated[UploadFile, File()],
-) -> Resume:
+) -> UploadResponse:
     if file.content_type not in {"application/pdf", "application/octet-stream"}:
         raise HTTPException(415, "Only PDF uploads are supported")
     try:
         data = read_bounded(file.file, settings)
-        extract_text(data, settings)
+        if not data.startswith(b"%PDF-"):
+            raise InvalidPDF("File is not a PDF")
     except PDFTooLarge as exc:
         raise HTTPException(413, str(exc)) from exc
     except InvalidPDF as exc:
@@ -56,12 +56,18 @@ def upload_resume(
     resume = Resume(id=resume_id, user_id=user.id, filename=filename, path=str(path))
     try:
         db.add(resume)
+        db.flush()
+        job = enqueue_resume(db, resume)
         db.commit()
     except Exception:
         db.rollback()
         path.unlink(missing_ok=True)
         raise
-    return resume
+    result = UploadResponse(
+        resume=ResumeResponse.model_validate(resume), job=JobResponse.model_validate(job)
+    )
+    publish_job(job.id)
+    return result
 
 
 @router.get("/{resume_id}", response_model=ResumeResponse)
@@ -69,26 +75,12 @@ def get_resume(resume_id: UUID, user: CurrentUser, db: Db) -> Resume:
     return owned_resume(resume_id, user.id, db)
 
 
-@router.post("/{resume_id}/analyze", response_model=ResumeResponse)
-def analyze_resume(resume_id: UUID, user: CurrentUser, db: Db, settings: Config) -> Resume:
+@router.post("/{resume_id}/analyze", response_model=JobResponse, status_code=202)
+def analyze_resume(resume_id: UUID, user: CurrentUser, db: Db) -> JobResponse:
     resume = owned_resume(resume_id, user.id, db)
-    path = Path(resume.path)
+    job = enqueue_resume(db, resume)
     db.commit()
-    try:
-        text = load_text(path, settings)
-        profile = extract_profile(text, settings)
-    except OSError as exc:
-        raise HTTPException(503, "Resume storage unavailable") from exc
-    except PDFTooLarge as exc:
-        raise HTTPException(413, str(exc)) from exc
-    except InvalidPDF as exc:
-        raise HTTPException(422, str(exc)) from exc
-    except OllamaTimeout as exc:
-        raise HTTPException(504, str(exc)) from exc
-    except OllamaUnavailable as exc:
-        raise HTTPException(503, str(exc)) from exc
-    except InvalidProfile as exc:
-        raise HTTPException(502, str(exc)) from exc
-    resume.profile = profile.model_dump(mode="json")
-    db.commit()
-    return resume
+    result = JobResponse.model_validate(job)
+    if job.status == "queued":
+        publish_job(job.id)
+    return result
