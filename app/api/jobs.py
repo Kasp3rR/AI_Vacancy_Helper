@@ -48,23 +48,27 @@ def get_results(
         .offset(offset)
         .limit(limit)
     )
+    items = []
+    for row in rows:
+        ranking_data = row.data.get("_ranking", {})
+        breakdown = None
+        if "_ranking" in row.data:
+            breakdown = RankingDetails.model_validate(ranking_data)
+        item = SearchResult(
+            vacancy=Vacancy.model_validate(row.data),
+            position=row.position,
+            score=row.score,
+            matched_skills=ranking_data.get("matched_skills", []),
+            missing_skills=ranking_data.get("missing_skills", []),
+            breakdown=breakdown,
+        )
+        items.append(item)
+
     return SearchResultsResponse(
         job=JobResponse.model_validate(job),
         ranked=job.params.get("ranking_version") == 1,
         total=total,
         offset=offset,
         limit=limit,
-        items=[
-            SearchResult(
-                vacancy=Vacancy.model_validate(row.data),
-                position=row.position,
-                score=row.score,
-                matched_skills=row.data.get("_ranking", {}).get("matched_skills", []),
-                missing_skills=row.data.get("_ranking", {}).get("missing_skills", []),
-                breakdown=RankingDetails.model_validate(row.data["_ranking"])
-                if "_ranking" in row.data
-                else None,
-            )
-            for row in rows
-        ],
+        items=items,
     )

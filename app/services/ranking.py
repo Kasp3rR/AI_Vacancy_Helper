@@ -10,7 +10,9 @@ EXPERIENCE_MINIMUM = {"noExperience": 0, "between1And3": 1, "between3And6": 3, "
 
 
 def normalize(value: str) -> str:
-    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+    value = unicodedata.normalize("NFKC", value)
+    value = value.casefold()
+    return " ".join(value.split())
 
 
 def skill_name(value: str) -> str:
@@ -28,51 +30,120 @@ class PlainText(HTMLParser):
 
 
 def vacancy_text(vacancy: Vacancy) -> str:
+    parts = [vacancy.name, vacancy.description or ""]
+    if vacancy.snippet:
+        for value in vacancy.snippet.values():
+            parts.append(value or "")
+
+    html = " ".join(parts).replace("\x00", " ")
     parser = PlainText()
-    parser.feed(
-        " ".join(
-            [
-                vacancy.name,
-                vacancy.description or "",
-                *[value or "" for value in (vacancy.snippet or {}).values()],
-            ]
-        ).replace("\x00", " ")
-    )
+    parser.feed(html)
     return normalize(" ".join(parser.parts))
 
 
 def contains(text: str, term: str) -> bool:
-    return re.search(r"(?<![\w+#.])" + re.escape(term) + r"(?![\w+#])", text) is not None
+    pattern = r"(?<![\w+#.])" + re.escape(term) + r"(?![\w+#])"
+    return re.search(pattern, text) is not None
+
+
+def compare_skills(profile: Profile, vacancy: Vacancy) -> tuple[list[str], list[str]]:
+    owned = set()
+    for value in profile.skills:
+        name = skill_name(value)
+        if name:
+            owned.add(name)
+
+    required = set()
+    for skill in vacancy.key_skills or []:
+        name = skill_name(skill.name)
+        if name:
+            required.add(name)
+
+    matched = []
+    missing = []
+    for name in sorted(required):
+        if name in owned:
+            matched.append(name)
+        else:
+            missing.append(name)
+    return matched, missing
+
+
+def title_score(profile: Profile, vacancy: Vacancy) -> float:
+    title = normalize(profile.title or "")
+    terms = set(re.findall(r"[\w]+(?:[+#]+)?|\.net", title))
+    for keyword in profile.keywords:
+        keyword = normalize(keyword)
+        if keyword:
+            terms.add(keyword)
+    if not terms:
+        return 0.0
+
+    text = vacancy_text(vacancy)
+    matches = 0
+    for term in terms:
+        if contains(text, term):
+            matches += 1
+    return matches / len(terms)
+
+
+def experience_score(profile: Profile, vacancy: Vacancy) -> float:
+    if profile.experience_years is None or vacancy.experience is None:
+        return 0.0
+
+    experience_id = vacancy.experience.id or ""
+    minimum = EXPERIENCE_MINIMUM.get(experience_id)
+    if minimum is None:
+        return 0.0
+    if experience_id == "moreThan6":
+        if profile.experience_years > 6:
+            return 1.0
+        return 0.0
+    if profile.experience_years >= minimum:
+        return 1.0
+    return 0.0
+
+
+def salary_score(profile: Profile, vacancy: Vacancy) -> float:
+    if not profile.salary:
+        return 1.0
+    if vacancy.salary is None:
+        return 0.0
+    if profile.currency != vacancy.salary.currency:
+        return 0.0
+
+    offered = vacancy.salary.upper
+    if offered is None:
+        offered = vacancy.salary.lower
+    if offered is None:
+        return 0.0
+    return max(0.0, min(1.0, offered / profile.salary))
+
+
+def region_score(profile: Profile, vacancy: Vacancy) -> float:
+    score = 0.0
+    if not profile.region or not normalize(profile.region):
+        score = 1.0
+    if profile.region and vacancy.area:
+        if normalize(profile.region) == normalize(vacancy.area.name):
+            score = 1.0
+        else:
+            score = 0.0
+    return score
 
 
 def evaluate(profile: Profile, vacancy: Vacancy) -> RankingDetails:
-    owned = {skill_name(value) for value in profile.skills if normalize(value)}
-    required = {
-        skill_name(skill.name) for skill in vacancy.key_skills or [] if normalize(skill.name)
-    }
-    matched = sorted(owned & required)
-    missing = sorted(required - owned)
-    skills = len(matched) / len(required) if required else 0.0
-    terms = set(re.findall(r"[\w]+(?:[+#]+)?|\.net", normalize(profile.title or "")))
-    terms.update(normalize(value) for value in profile.keywords if normalize(value))
-    text = vacancy_text(vacancy)
-    title_keywords = sum(contains(text, term) for term in terms) / len(terms) if terms else 0.0
-    experience = 0.0
-    minimum = EXPERIENCE_MINIMUM.get(vacancy.experience.id or "") if vacancy.experience else None
-    if minimum is not None and profile.experience_years is not None:
-        experience = float(profile.experience_years >= minimum)
-        if vacancy.experience and vacancy.experience.id == "moreThan6":
-            experience = float(profile.experience_years > 6)
-    salary = 1.0 if not profile.salary else 0.0
-    if profile.salary and vacancy.salary and profile.currency == vacancy.salary.currency:
-        offered = vacancy.salary.upper if vacancy.salary.upper is not None else vacancy.salary.lower
-        if offered is not None:
-            salary = max(0.0, min(1.0, offered / profile.salary))
-    region = 1.0 if not profile.region or not normalize(profile.region) else 0.0
-    if profile.region and vacancy.area:
-        region = float(normalize(profile.region) == normalize(vacancy.area.name))
-    preferences = (salary + region) / 2
+    matched, missing = compare_skills(profile, vacancy)
+    required_count = len(matched) + len(missing)
+    skills = 0.0
+    if required_count > 0:
+        skills = len(matched) / required_count
+
+    title_keywords = title_score(profile, vacancy)
+    experience = experience_score(profile, vacancy)
+    preferences = (salary_score(profile, vacancy) + region_score(profile, vacancy)) / 2
     score = round(60 * skills + 20 * title_keywords + 10 * experience + 10 * preferences, 2)
+
     return RankingDetails(
         score=score,
         matched_skills=matched,
@@ -84,16 +155,24 @@ def evaluate(profile: Profile, vacancy: Vacancy) -> RankingDetails:
     )
 
 
+def ranking_sort_key(item: tuple[Vacancy, RankingDetails]) -> tuple[float, float, str]:
+    vacancy, ranking = item
+    numeric_id: float = float("inf")
+    if vacancy.id.isdecimal():
+        numeric_id = int(vacancy.id)
+    return -ranking.score, numeric_id, vacancy.id
+
+
 def rank_vacancies(
     profile: Profile, vacancies: list[Vacancy]
 ) -> list[tuple[Vacancy, RankingDetails]]:
-    unique = {vacancy.id: vacancy for vacancy in vacancies}
-    results = [(vacancy, evaluate(profile, vacancy)) for vacancy in unique.values()]
-    return sorted(
-        results,
-        key=lambda item: (
-            -item[1].score,
-            int(item[0].id) if item[0].id.isdecimal() else float("inf"),
-            item[0].id,
-        ),
-    )
+    unique = {}
+    for vacancy in vacancies:
+        unique[vacancy.id] = vacancy
+
+    results = []
+    for vacancy in unique.values():
+        ranking = evaluate(profile, vacancy)
+        results.append((vacancy, ranking))
+    results.sort(key=ranking_sort_key)
+    return results

@@ -52,4 +52,5 @@ def extract_text(data: bytes, settings: Settings) -> str:
 
 def load_text(path: Path, settings: Settings) -> str:
     with path.open("rb") as file:
-        return extract_text(read_bounded(file, settings), settings)
+        data = read_bounded(file, settings)
+    return extract_text(data, settings)

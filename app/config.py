@@ -29,9 +29,12 @@ class Settings(BaseSettings):
 
     @property
     def job_time_limit(self) -> int:
-        return int(
-            max(self.ollama_timeout_seconds * 3 + 90, 33 * (self.hh_timeout_seconds * 3 + 20) + 60)
-        )
+        resume_time = self.ollama_timeout_seconds * 3 + 90
+        request_time = self.hh_timeout_seconds * 3 + 20
+        search_pages = 3
+        detail_batches = 150 // 5
+        search_time = (search_pages + detail_batches) * request_time + 60
+        return int(max(resume_time, search_time))
 
 
 @lru_cache

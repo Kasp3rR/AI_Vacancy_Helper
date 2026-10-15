@@ -22,5 +22,6 @@ def get_session_factory() -> sessionmaker[Session]:
 
 
 def get_db() -> Iterator[Session]:
-    with get_session_factory()() as session:
+    session_factory = get_session_factory()
+    with session_factory() as session:
         yield session

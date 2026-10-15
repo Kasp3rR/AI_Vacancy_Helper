@@ -15,16 +15,14 @@ HH_CACHE_TTL = 900
 class HHCache:
     def __init__(self, settings: Settings, backend: Redis | None = None):
         self.settings = settings
-        self.backend = (
-            backend
-            if backend is not None
-            else Redis.from_url(
+        if backend is None:
+            backend = Redis.from_url(
                 settings.redis_url,
                 decode_responses=True,
                 socket_connect_timeout=0.5,
                 socket_timeout=0.5,
             )
-        )
+        self.backend = backend
 
     def key(self, path: str, params: dict[str, Any]) -> str:
         payload = json.dumps(
@@ -38,7 +36,8 @@ class HHCache:
             separators=(",", ":"),
             ensure_ascii=False,
         )
-        return "hh:v1:" + hashlib.sha256(payload.encode()).hexdigest()
+        digest = hashlib.sha256(payload.encode()).hexdigest()
+        return "hh:v1:" + digest
 
     def get(self, path: str, params: dict[str, Any]) -> Any:
         try:
@@ -51,8 +50,8 @@ class HHCache:
 
     def set(self, path: str, params: dict[str, Any], payload: dict[str, Any]) -> None:
         try:
-            self.backend.setex(
-                self.key(path, params), HH_CACHE_TTL, json.dumps(payload, ensure_ascii=False)
-            )
+            key = self.key(path, params)
+            value = json.dumps(payload, ensure_ascii=False)
+            self.backend.setex(key, HH_CACHE_TTL, value)
         except RedisError:
             logger.warning("hh.ru cache write unavailable")

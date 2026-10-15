@@ -37,9 +37,10 @@ def register(data: Credentials, db: Db, settings: Config, response: Response) ->
 @router.post("/login", response_model=TokenPair)
 def login(data: Credentials, db: Db, settings: Config, response: Response) -> TokenPair:
     user = db.scalar(select(User).where(User.email == str(data.email)))
-    verified = passwords.verify(
-        data.password.get_secret_value(), user.password_hash if user else DUMMY_HASH
-    )
+    password_hash = DUMMY_HASH
+    if user is not None:
+        password_hash = user.password_hash
+    verified = passwords.verify(data.password.get_secret_value(), password_hash)
     if not verified or user is None:
         raise unauthorized()
     tokens = issue_tokens(db, user, settings)

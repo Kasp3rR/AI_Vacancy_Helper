@@ -28,10 +28,21 @@ def start_search(resume_id: UUID, data: SearchRequest, user: CurrentUser, db: Db
         profile = Profile.model_validate(resume.profile)
     except ValidationError:
         raise HTTPException(409, "Resume profile is invalid; analyze it again") from None
-    text = data.text or (profile.title or "").strip() or " ".join(profile.skills[:5])[:200]
+    text = data.text
+    if not text:
+        text = (profile.title or "").strip()
+    if not text:
+        text = " ".join(profile.skills[:5])[:200]
     if not text:
         raise HTTPException(422, "Provide search text; the profile has no title or skills")
-    query = HHSearch(**(data.model_dump(exclude={"max_pages"}) | {"text": text}))
+    query = HHSearch(
+        text=text,
+        area=data.area,
+        salary=data.salary,
+        currency=data.currency,
+        experience=data.experience,
+        per_page=data.per_page,
+    )
     spec = SearchSpec(query=query, max_pages=data.max_pages, profile=profile)
     try:
         job = enqueue_search(db, resume, spec)

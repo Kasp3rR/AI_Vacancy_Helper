@@ -21,9 +21,11 @@ class InvalidProfile(Exception):
 
 
 def transient(exc: BaseException) -> bool:
-    return isinstance(exc, httpx.ConnectError) or (
-        isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {429, 502, 503, 504}
-    )
+    if isinstance(exc, httpx.ConnectError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {429, 502, 503, 504}
+    return False
 
 
 @retry(

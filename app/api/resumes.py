@@ -40,7 +40,9 @@ def upload_resume(
         raise HTTPException(422, str(exc)) from exc
     resume_id = new_id()
     path = settings.upload_dir.resolve() / f"{resume_id}.pdf"
-    filename = (file.filename or "resume.pdf").replace("\\", "/").split("/")[-1]
+    filename = file.filename or "resume.pdf"
+    filename = filename.replace("\\", "/")
+    filename = filename.split("/")[-1]
     filename = filename[:255] or "resume.pdf"
     created = False
     try:

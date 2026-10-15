@@ -52,7 +52,12 @@ def enqueue_search(db: Session, resume: Resume, spec: SearchSpec) -> Job:
 
 def publish_job(job_id: str, kind: str = "resume") -> bool:
     try:
-        task = {"resume": "app.tasks.process_resume", "search": "app.tasks.process_search"}[kind]
+        if kind == "resume":
+            task = "app.tasks.process_resume"
+        elif kind == "search":
+            task = "app.tasks.process_search"
+        else:
+            raise ValueError("Unknown job kind")
         celery_app.send_task(task, args=[job_id], task_id=job_id, retry=False)
         return True
     except Exception:
@@ -62,13 +67,15 @@ def publish_job(job_id: str, kind: str = "resume") -> bool:
 
 def recover_jobs(sessions: sessionmaker[Session], settings: Settings) -> int:
     now = datetime.now(UTC)
+    running_deadline = now - timedelta(seconds=settings.job_time_limit + 60)
+    queued_deadline = now - timedelta(seconds=30)
     with sessions() as db:
         db.execute(
             update(Job)
             .where(
                 Job.kind.in_(["resume", "search"]),
                 Job.status == "running",
-                Job.updated_at < now - timedelta(seconds=settings.job_time_limit + 60),
+                Job.updated_at < running_deadline,
             )
             .values(status="failed", error="Worker stopped or processing time limit exceeded")
         )
@@ -78,7 +85,7 @@ def recover_jobs(sessions: sessionmaker[Session], settings: Settings) -> int:
                 .where(
                     Job.kind.in_(["resume", "search"]),
                     Job.status == "queued",
-                    Job.updated_at < now - timedelta(seconds=30),
+                    Job.updated_at < queued_deadline,
                 )
                 .order_by(Job.updated_at)
                 .limit(100)

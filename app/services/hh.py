@@ -79,14 +79,18 @@ class SearchPage(BaseModel):
 
 
 def transient(exc: BaseException) -> bool:
-    return isinstance(exc, httpx.TransportError) or (
-        isinstance(exc, httpx.HTTPStatusError)
-        and (exc.response.status_code == 429 or exc.response.status_code >= 500)
-    )
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status == 429 or status >= 500
+    return False
 
 
 def retry_delay(state: RetryCallState) -> float:
-    exc = state.outcome.exception() if state.outcome else None
+    exc = None
+    if state.outcome is not None:
+        exc = state.outcome.exception()
     if isinstance(exc, httpx.HTTPStatusError):
         value = exc.response.headers.get("Retry-After")
         if value:
@@ -113,7 +117,11 @@ def get_response(client: httpx.Client, path: str, params: dict[str, Any]) -> htt
 class HHClient:
     def __init__(self, settings: Settings, cache: HHCache | None = None, *, use_cache: bool = True):
         self.settings = settings
-        self.cache = (cache if cache is not None else HHCache(settings)) if use_cache else None
+        self.cache: HHCache | None = None
+        if use_cache:
+            if cache is None:
+                cache = HHCache(settings)
+            self.cache = cache
 
     def _get(self, path: str, params: dict[str, Any]) -> Any:
         try:
@@ -171,10 +179,13 @@ class HHClient:
         if (query.page + 1) * query.per_page > 2000:
             raise ValueError("hh.ru search depth cannot exceed 2000 results")
         result: dict[str, Vacancy] = {}
-        for page in range(query.page, min(query.page + max_pages, 2000 // query.per_page)):
-            data = self.search(query.model_copy(update={"page": page}))
+        last_page = min(query.page + max_pages, 2000 // query.per_page)
+        for page in range(query.page, last_page):
+            page_query = query.model_copy(update={"page": page})
+            data = self.search(page_query)
             for vacancy in data.items:
-                result.setdefault(vacancy.id, vacancy)
+                if vacancy.id not in result:
+                    result[vacancy.id] = vacancy
             if not data.items or page + 1 >= data.pages:
                 break
         return list(result.values())

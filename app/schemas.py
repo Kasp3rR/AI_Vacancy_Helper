@@ -60,7 +60,12 @@ class Profile(BaseModel):
     @field_validator("skills", "keywords")
     @classmethod
     def normalize_terms(cls, values: list[str]) -> list[str]:
-        return sorted({v.strip().casefold() for v in values if v.strip()})
+        terms = set()
+        for value in values:
+            term = value.strip().casefold()
+            if term:
+                terms.add(term)
+        return sorted(terms)
 
 
 class ResumeResponse(BaseModel):

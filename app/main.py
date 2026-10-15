@@ -16,7 +16,9 @@ def create_app() -> FastAPI:
 
     @application.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
-        details = [{"loc": e["loc"], "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
+        details = []
+        for error in exc.errors():
+            details.append({"loc": error["loc"], "msg": error["msg"], "type": error["type"]})
         return JSONResponse(status_code=422, content={"detail": details})
 
     @application.get("/health", tags=["health"])

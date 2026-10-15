@@ -42,7 +42,10 @@ def process_search(job_id: str, sessions: sessionmaker[Session], settings: Setti
                 return None
 
         with ThreadPoolExecutor(max_workers=5) as pool:
-            cards = [card for card in pool.map(details, vacancies) if card is not None]
+            cards = []
+            for card in pool.map(details, vacancies):
+                if card is not None:
+                    cards.append(card)
         ranked = rank_vacancies(spec.profile, cards)
         with sessions() as db:
             job = db.scalar(select(Job).where(Job.id == job_id).with_for_update())
@@ -50,17 +53,19 @@ def process_search(job_id: str, sessions: sessionmaker[Session], settings: Setti
                 return "ignored"
             db.execute(delete(Recommendation).where(Recommendation.job_id == job_id))
             for position, (vacancy, ranking) in enumerate(ranked):
-                db.add(
-                    Recommendation(
-                        job_id=job_id,
-                        vacancy_id=vacancy.id,
-                        position=position,
-                        score=ranking.score,
-                        data=vacancy.model_dump(mode="json", by_alias=True)
-                        | {"_ranking": ranking.model_dump(mode="json")},
-                    )
+                data = vacancy.model_dump(mode="json", by_alias=True)
+                data["_ranking"] = ranking.model_dump(mode="json")
+                recommendation = Recommendation(
+                    job_id=job_id,
+                    vacancy_id=vacancy.id,
+                    position=position,
+                    score=ranking.score,
+                    data=data,
                 )
-            job.params = job.params | {"ranking_version": 1}
+                db.add(recommendation)
+            updated_params = job.params.copy()
+            updated_params["ranking_version"] = 1
+            job.params = updated_params
             job.status = "succeeded"
             job.error = None
             db.commit()
