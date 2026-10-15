@@ -23,12 +23,14 @@ celery_app.conf.update(
     broker_connection_retry_on_startup=True,
     broker_connection_timeout=2,
     broker_transport_options={
-        "visibility_timeout": 3600,
+        "visibility_timeout": max(3600, settings.job_time_limit + 300),
         "socket_connect_timeout": 2,
         "socket_timeout": 2,
     },
-    result_backend_transport_options={"visibility_timeout": 3600},
-    visibility_timeout=3600,
+    result_backend_transport_options={
+        "visibility_timeout": max(3600, settings.job_time_limit + 300)
+    },
+    visibility_timeout=max(3600, settings.job_time_limit + 300),
     result_expires=86400,
     task_default_queue="resume_processing",
     beat_schedule={"recover-jobs": {"task": "app.tasks.recover_jobs", "schedule": 30.0}},

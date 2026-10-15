@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 
 from app.api.dependencies import CurrentUser, Db
 from app.models import Job, Recommendation, Resume
-from app.schemas import JobResponse, SearchResult, SearchResultsResponse
+from app.schemas import JobResponse, RankingDetails, SearchResult, SearchResultsResponse
 from app.services.hh import Vacancy
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -50,12 +50,20 @@ def get_results(
     )
     return SearchResultsResponse(
         job=JobResponse.model_validate(job),
+        ranked=job.params.get("ranking_version") == 1,
         total=total,
         offset=offset,
         limit=limit,
         items=[
             SearchResult(
-                vacancy=Vacancy.model_validate(row.data), position=row.position, score=row.score
+                vacancy=Vacancy.model_validate(row.data),
+                position=row.position,
+                score=row.score,
+                matched_skills=row.data.get("_ranking", {}).get("matched_skills", []),
+                missing_skills=row.data.get("_ranking", {}).get("missing_skills", []),
+                breakdown=RankingDetails.model_validate(row.data["_ranking"])
+                if "_ranking" in row.data
+                else None,
             )
             for row in rows
         ],

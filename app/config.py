@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     @property
     def job_time_limit(self) -> int:
         return int(
-            max(self.ollama_timeout_seconds * 3 + 90, 3 * (self.hh_timeout_seconds * 3 + 20) + 60)
+            max(self.ollama_timeout_seconds * 3 + 90, 33 * (self.hh_timeout_seconds * 3 + 20) + 60)
         )
 
 

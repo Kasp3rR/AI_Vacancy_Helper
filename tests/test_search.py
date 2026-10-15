@@ -63,6 +63,10 @@ def test_search_persistence_pagination_cache_and_duplicate_delivery(api, ready, 
         route = mock.get(settings.hh_url + "/vacancies").respond(
             200, json=page([vacancy("2"), vacancy("1")])
         )
+        for identifier in ("1", "2"):
+            mock.get(settings.hh_url + "/vacancies/" + identifier).respond(
+                200, json=dict(vacancy(identifier), key_skills=[{"name": "Python"}])
+            )
         for _ in range(2):
             job_id = api.request("POST", url, json={}, headers=headers).json()["id"]
             assert process_search(job_id, api.sessions, settings) == "succeeded"
@@ -71,9 +75,11 @@ def test_search_persistence_pagination_cache_and_duplicate_delivery(api, ready, 
     response = api.request("GET", f"/jobs/{job_id}/results?offset=1&limit=1", headers=headers)
     assert response.status_code == 200
     data = response.json()
-    assert data["total"] == 2 and data["ranked"] is False
-    assert data["items"][0]["vacancy"]["id"] == "1"
-    assert data["items"][0]["score"] is None and data["items"][0]["position"] == 1
+    assert data["total"] == 2 and data["ranked"] is True
+    assert data["items"][0]["vacancy"]["id"] == "2"
+    assert data["items"][0]["score"] == 83.33
+    assert data["items"][0]["matched_skills"] == ["python"]
+    assert data["items"][0]["position"] == 1
     other = bearer(register(api, "other@example.com"))
     assert api.request("GET", f"/jobs/{job_id}/results", headers=other).status_code == 404
 
@@ -122,7 +128,9 @@ def test_search_recovery_and_stale_result_guard(api, ready, settings, mocker):
         recover_jobs(api.sessions, settings)
         return [Vacancy.model_validate(vacancy())]
 
-    mocker.patch("app.services.search.HHClient").return_value.search_all.side_effect = search
+    client = mocker.patch("app.services.search.HHClient").return_value
+    client.search_all.side_effect = search
+    client.vacancy.return_value = Vacancy.model_validate(vacancy())
     assert process_search(job_id, api.sessions, settings) == "ignored"
     with api.sessions() as db:
         assert db.get(Job, job_id).status == "failed"
@@ -136,3 +144,70 @@ def test_empty_search_succeeds(api, ready, settings, mocker):
     assert process_search(job_id, api.sessions, settings) == "succeeded"
     result = api.request("GET", f"/jobs/{job_id}/results", headers=headers).json()
     assert result["total"] == 0 and result["items"] == []
+
+
+def test_ranking_uses_snapshot_and_details(api, ready, settings, mocker):
+    headers, url = ready
+    job_id = api.request("POST", url, json={}, headers=headers).json()["id"]
+    with api.sessions() as db:
+        resume = db.get(Resume, db.get(Job, job_id).resume_id)
+        resume.profile = dict(resume.profile, skills=["java"])
+        db.commit()
+    client = mocker.patch("app.services.search.HHClient").return_value
+    client.search_all.return_value = [
+        Vacancy.model_validate(vacancy("1")),
+        Vacancy.model_validate(vacancy("2")),
+    ]
+    client.vacancy.side_effect = lambda id: Vacancy.model_validate(
+        dict(vacancy(id), key_skills=[{"name": "Java" if id == "1" else "Python"}])
+    )
+    llm = mocker.patch("app.services.processing.extract_profile")
+    assert process_search(job_id, api.sessions, settings) == "succeeded"
+    result = api.request("GET", f"/jobs/{job_id}/results", headers=headers).json()
+    assert result["ranked"] is True
+    assert [item["vacancy"]["id"] for item in result["items"]] == ["2", "1"]
+    assert result["items"][0]["matched_skills"] == ["python"]
+    assert result["items"][1]["missing_skills"] == ["java"]
+    assert result["items"][0]["breakdown"]["version"] == 1
+    llm.assert_not_called()
+
+
+def test_detail_failure_does_not_publish_partial_ranking(api, ready, settings, mocker):
+    from app.services.hh import HHUnavailable
+
+    headers, url = ready
+    job_id = api.request("POST", url, json={}, headers=headers).json()["id"]
+    client = mocker.patch("app.services.search.HHClient").return_value
+    client.search_all.return_value = [Vacancy.model_validate(vacancy())]
+    client.vacancy.side_effect = HHUnavailable("hh.ru is temporarily unavailable")
+    with pytest.raises(SearchProcessingFailed):
+        process_search(job_id, api.sessions, settings)
+    with api.sessions() as db:
+        assert db.get(Job, job_id).status == "failed"
+        assert list(db.scalars(select(Recommendation))) == []
+
+
+def test_removed_vacancy_is_skipped(api, ready, settings, mocker):
+    from app.services.hh import HHNotFound
+
+    headers, url = ready
+    job_id = api.request("POST", url, json={}, headers=headers).json()["id"]
+    client = mocker.patch("app.services.search.HHClient").return_value
+    client.search_all.return_value = [Vacancy.model_validate(vacancy())]
+    client.vacancy.side_effect = HHNotFound("Vacancy not found")
+    assert process_search(job_id, api.sessions, settings) == "succeeded"
+    data = api.request("GET", f"/jobs/{job_id}/results", headers=headers).json()
+    assert data["ranked"] is True and data["total"] == 0
+
+
+def test_legacy_results_remain_readable(api, ready):
+    headers, url = ready
+    job_id = api.request("POST", url, json={}, headers=headers).json()["id"]
+    with api.sessions() as db:
+        db.get(Job, job_id).status = "succeeded"
+        db.add(Recommendation(job_id=job_id, vacancy_id="1", score=None, data=vacancy()))
+        db.commit()
+    data = api.request("GET", f"/jobs/{job_id}/results", headers=headers).json()
+    assert data["ranked"] is False
+    assert data["items"][0]["score"] is None
+    assert data["items"][0]["breakdown"] is None

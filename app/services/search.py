@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+
 from billiard.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session, sessionmaker
@@ -5,7 +7,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import Settings
 from app.models import Job, Recommendation
 from app.schemas import SearchSpec
-from app.services.hh import HHClient, HHError
+from app.services.hh import HHClient, HHError, HHNotFound, Vacancy
+from app.services.ranking import rank_vacancies
 
 
 class SearchProcessingFailed(Exception):
@@ -29,22 +32,35 @@ def process_search(job_id: str, sessions: sessionmaker[Session], settings: Setti
             return "ignored"
     try:
         spec = SearchSpec.model_validate(params)
-        vacancies = HHClient(settings).search_all(spec.query, max_pages=spec.max_pages)
+        client = HHClient(settings)
+        vacancies = client.search_all(spec.query, max_pages=spec.max_pages)
+
+        def details(vacancy: Vacancy) -> Vacancy | None:
+            try:
+                return client.vacancy(vacancy.id)
+            except HHNotFound:
+                return None
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            cards = [card for card in pool.map(details, vacancies) if card is not None]
+        ranked = rank_vacancies(spec.profile, cards)
         with sessions() as db:
             job = db.scalar(select(Job).where(Job.id == job_id).with_for_update())
             if job is None or job.status != "running":
                 return "ignored"
             db.execute(delete(Recommendation).where(Recommendation.job_id == job_id))
-            for position, vacancy in enumerate(vacancies):
+            for position, (vacancy, ranking) in enumerate(ranked):
                 db.add(
                     Recommendation(
                         job_id=job_id,
                         vacancy_id=vacancy.id,
                         position=position,
-                        score=None,
-                        data=vacancy.model_dump(mode="json", by_alias=True),
+                        score=ranking.score,
+                        data=vacancy.model_dump(mode="json", by_alias=True)
+                        | {"_ranking": ranking.model_dump(mode="json")},
                     )
                 )
+            job.params = job.params | {"ranking_version": 1}
             job.status = "succeeded"
             job.error = None
             db.commit()

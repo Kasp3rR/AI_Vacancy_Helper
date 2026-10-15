@@ -107,15 +107,29 @@ class SearchSpec(BaseModel):
     profile: Profile
 
 
+class RankingDetails(BaseModel):
+    version: Literal[1] = 1
+    score: float = Field(ge=0, le=100)
+    matched_skills: list[str]
+    missing_skills: list[str]
+    skills: float = Field(ge=0, le=1)
+    title_keywords: float = Field(ge=0, le=1)
+    experience: float = Field(ge=0, le=1)
+    salary_region: float = Field(ge=0, le=1)
+
+
 class SearchResult(BaseModel):
     vacancy: Vacancy
     position: int
-    score: float | None
+    score: float | None = Field(ge=0, le=100)
+    matched_skills: list[str] = Field(default_factory=list)
+    missing_skills: list[str] = Field(default_factory=list)
+    breakdown: RankingDetails | None = None
 
 
 class SearchResultsResponse(BaseModel):
     job: JobResponse
-    ranked: Literal[False] = False
+    ranked: bool = False
     total: int
     offset: int
     limit: int
